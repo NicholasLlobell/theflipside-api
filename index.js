@@ -1,8 +1,10 @@
+require('dotenv').config()
 const express = require('express');
 const cors = require('cors');
 const mongoose = require("mongoose");
 const User = require('./models/User');
 const Post = require('./models/Post');
+const Comment = require('./models/Comment')
 const bcrypt = require('bcryptjs');
 const app = express();
 const jwt = require('jsonwebtoken');
@@ -10,16 +12,24 @@ const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const uploadMiddleware = multer({ dest: 'uploads/' });
 const fs = require('fs');
+const isAuthenticated = require('./middleware/isAuthenticated')
+const fileUploader = require('./middleware/cloudinary')
 
 const salt = bcrypt.genSaltSync(10);
-const secret = 'secrefuckingkeystress';
+const secret = process.env.SECRET;
 
-app.use(cors({credentials:true,origin:'http://localhost:3000'}));
+app.use(cors({credentials:true, origin: process.env.REACT_APP_URI}));
 app.use(express.json());
 app.use(cookieParser());
 app.use('/uploads', express.static(__dirname + '/uploads'));
 
-mongoose.connect('mongodb+srv://flipside:oL53dT0VwhYzcFxE@cluster0.oygqebr.mongodb.net/?retryWrites=true&w=majority');
+mongoose.connect(process.env.MONGODB_URI)
+.then((x) => {
+  console.log(`Connected to Mongo! Database name: "${x.connections[0].name}"`);
+})
+.catch((err) => {
+  console.error("Error connecting to mongo: ", err);
+});
 
 app.post('/register', async (req,res) => {
   const {username,password} = req.body;
@@ -42,83 +52,86 @@ app.post('/login', async (req,res) => {
   if (userDoc) {
     const passOk = bcrypt.compareSync(password, userDoc.password);
     if (passOk) {
-      jwt.sign({username,id:userDoc._id}, secret, {}, (err,token) => {
-        if (err) throw err;
-        res.cookie('token', token).json({
-          id:userDoc._id,
-          username,
-        });
-      });
-    }
+      const { _id, username } = userDoc;
+          
+      // Create an object that will be set as the token payload
+      const payload = { _id, username };
+
+      // Create and sign the token
+      const authToken = jwt.sign( 
+        payload,
+        process.env.SECRET,
+        { algorithm: 'HS256', expiresIn: "6h" }
+      );
+
+      // Send the token as the response
+        res.status(200).json({ authToken: authToken, user: payload });
+      } else {
+        res.status(400).json('NARC SHARK 🦈 TRY AGAIN')
+      }
     // logged in
   } else {
     res.status(400).json('NARC SHARK 🦈 TRY AGAIN');
   }
 });
 
-app.get('/profile', (req,res) => {
-  const {token} = req.cookies;
-  jwt.verify(token, secret, {}, (err,info) => {
-    if (err) throw err;
-    res.json(info);
+app.get('/profile', isAuthenticated, (req,res) => {
+  res.json(req.user)
+});
+
+// app.post('/logout', (req,res) => {
+//   res.cookie('token', '').json('ok');
+// });
+
+app.post('/post',  async (req,res) => {
+console.log("REQ.BODY ===>", req.body)
+try {
+  const {title,summary,content,author, files} = req.body;
+  const postDoc = await Post.create({
+    title,
+    summary,
+    content,
+    cover: files,
+    author
   });
-});
+  res.json(postDoc);
 
-app.post('/logout', (req,res) => {
-  res.cookie('token', '').json('ok');
-});
+} catch(err) {
+  console.log(err)
+  res.json(err)
+}
 
-app.post('/post', uploadMiddleware.single('file'), async (req,res) => {
-  const {originalname,path} = req.file;
-  const parts = originalname.split('.');
-  const ext = parts[parts.length - 1];
-  const newPath = path+'.'+ext;
-  fs.renameSync(path, newPath);
-
-  const {token} = req.cookies;
-  jwt.verify(token, secret, {}, async (err,info) => {
-    if (err) throw err;
-    const {title,summary,content} = req.body;
-    const postDoc = await Post.create({
-      title,
-      summary,
-      content,
-      cover:newPath,
-      author:info.id,
-    });
-    res.json(postDoc);
-  });
 
 });
 
-app.put('/post',uploadMiddleware.single('file'), async (req,res) => {
-  let newPath = null;
-  if (req.file) {
-    const {originalname,path} = req.file;
-    const parts = originalname.split('.');
-    const ext = parts[parts.length - 1];
-    newPath = path+'.'+ext;
-    fs.renameSync(path, newPath);
-  }
+app.put('/post', isAuthenticated, async (req,res) => {
 
-  const {token} = req.cookies;
-  jwt.verify(token, secret, {}, async (err,info) => {
-    if (err) throw err;
-    const {id,title,summary,content} = req.body;
+  try {
+    const {id,title,summary,content, files} = req.body;
     const postDoc = await Post.findById(id);
-    const isAuthor = JSON.stringify(postDoc.author) === JSON.stringify(info.id);
+    console.log("This is postDoc", postDoc)
+
+    const isAuthor = postDoc.author.toString() === req.user._id.toString();
+    console.log("isAuthor check", isAuthor)
     if (!isAuthor) {
       return res.status(400).json('SUS SHRIMP 🦐 YOU ARE NOT THE AUTHOR');
+    } else {
+  
+      let updated = await Post.findByIdAndUpdate(id, {
+        title,
+        summary,
+        content,
+        cover: files,
+      }, {new: true});
+  
+      res.json(updated);
     }
-    await postDoc.update({
-      title,
-      summary,
-      content,
-      cover: newPath ? newPath : postDoc.cover,
-    });
 
-    res.json(postDoc);
-  });
+  } catch(err) {
+    console.log(err)
+    res.json(err)
+  }
+
 
 });
 
@@ -138,10 +151,59 @@ app.get('/post', (req, res, next) => {
 
 app.get('/post/:id', async (req, res) => {
   const {id} = req.params;
-  const postDoc = await Post.findById(id).populate('author', ['username']);
+  const postDoc = await Post.findById(id).populate('author', ['username']).populate({path: 'comments', populate: {path: 'author'}})
   res.json(postDoc);
 })
 
-app.listen(4000);
+app.post('/new-comment/:postId', isAuthenticated, (req, res, next) => {
+
+  Comment.create({
+    comment: req.body.comment,
+    author: req.user._id
+  })
+  .then((createdComment) => {
+    console.log("this is createdComment", createdComment)
+    Post.findByIdAndUpdate(
+      req.params.postId,
+      {
+        $push: {comments: createdComment._id}
+      },
+      {new: true}
+    )
+    .then((toPopulate) => {
+      return toPopulate.populate('author', ['username'])
+    })
+    .then((populated) => {
+      console.log("This is after populated", populated)
+      return populated.populate({path: 'comments', populate: {path: 'author'}})      
+    })
+    .then((final) => {
+      console.log("final populate", final)
+      res.json(final)
+    })
+    .catch((err) => {
+      console.log(err)
+      res.json(err)
+    })
+  })
+  .catch((err) => {
+    console.log(err)
+    res.json(err)
+  })
+
+})
+
+app.post('/new-photo', fileUploader.single("image"), (req, res, next) => {
+  if (!req.file) {
+    next(new Error("No file uploaded!"));
+    return;
+  }
+  console.log("this is file", req.file)
+  res.json({ image: req.file.path });
+})
+
+app.listen(process.env.PORT, () => {
+  console.log("Server up and running! On " + process.env.PORT)
+});
 // mongodb+srv://flipside:oL53dT0VwhYzcFxE@cluster0.oygqebr.mongodb.net/?retryWrites=true&w=majority
 // oL53dT0VwhYzcFxE
